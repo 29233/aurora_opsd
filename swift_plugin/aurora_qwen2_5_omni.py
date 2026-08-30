@@ -5,14 +5,39 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from swift.llm import Model, ModelGroup, ModelMeta, TemplateMeta, register_model, register_template
-from swift.llm.model.model.qwen import get_model_tokenizer_qwen2_5_omni
-from swift.llm.model.model_arch import ModelArch
-from swift.llm.template.template.qwen import Qwen2_5OmniTemplate
-from swift.llm.template.template_inputs import StdTemplateInputs
-
 from swift_plugin.segmentation import load_gt_masks, preprocess_sam_frames
 from swift_plugin.segmentation import attach_aurora_segmentation
+
+# ---------------------------------------------------------------------------
+# ms-swift version compatibility layer.
+#
+# ms-swift <= 3.x exposes everything under ``swift.llm`` and registers models
+# via a ``get_function`` loader callback. ms-swift >= 4.x flattened the
+# package (``swift.model`` / ``swift.template`` / ``swift.dataset``) and
+# switched registration to ``ModelLoader`` subclasses. Support both layouts
+# from a single plugin file so the same code runs in the base env (swift
+# 3.10.1, used by the existing SFT/eval scripts) and the swift46 env (swift
+# 4.5.2, used for OPSD/GKD training).
+# ---------------------------------------------------------------------------
+try:  # ms-swift >= 4.x
+    from swift.model.model_meta import Model, ModelGroup, ModelMeta
+    from swift.model.model_arch import ModelArch
+    from swift.model.register import register_model
+    from swift.model.models.qwen import Qwen2_5OmniLoader
+    from swift.template.register import register_template
+    from swift.template.template_meta import TemplateMeta
+    from swift.template.templates.qwen import Qwen2_5OmniTemplate
+    from swift.template.template_inputs import StdTemplateInputs
+
+    _SWIFT_MAJOR = 4
+except ImportError:  # ms-swift <= 3.x
+    from swift.llm import Model, ModelGroup, ModelMeta, TemplateMeta, register_model, register_template
+    from swift.llm.model.model.qwen import get_model_tokenizer_qwen2_5_omni
+    from swift.llm.model.model_arch import ModelArch
+    from swift.llm.template.template.qwen import Qwen2_5OmniTemplate
+    from swift.llm.template.template_inputs import StdTemplateInputs
+
+    _SWIFT_MAJOR = 3
 
 
 # Transformers 4.57 calls unwrap_model(..., keep_torch_compile=...), while
@@ -36,30 +61,72 @@ MODEL_TYPE = "aurora_qwen2_5_omni"
 TEMPLATE_TYPE = "aurora_qwen2_5_omni"
 
 
-def get_model_tokenizer_aurora_qwen2_5_omni(model_dir, *args, **kwargs):
-    model, processor = get_model_tokenizer_qwen2_5_omni(model_dir, *args, **kwargs)
-    if model is not None:
-        model.aurora_processor = processor
-        checkpoint = os.environ.get("AURORA_SAM_CHECKPOINT", "")
-        attach_aurora_segmentation(model, processor, checkpoint)
-    return model, processor
+def _attach_aurora(model, processor):
+    """Attach the AURORA SAM segmentation head to a loaded Omni model."""
+    if model is None:
+        return
+    model.aurora_processor = processor
+    checkpoint = os.environ.get("AURORA_SAM_CHECKPOINT", "")
+    attach_aurora_segmentation(model, processor, checkpoint)
+
+
+if _SWIFT_MAJOR >= 4:
+
+    class AuroraQwen2_5OmniLoader(Qwen2_5OmniLoader):
+        """Qwen2_5OmniLoader + AURORA SAM head attachment.
+
+        The 4.x loader class takes over everything the old
+        ``get_model_tokenizer_qwen2_5_omni`` callback did (config tweaks,
+        thinker/talker wiring, processor patching); we only wrap ``load`` to
+        attach the segmentation head to whatever it produces.
+        """
+
+        def load(self):
+            model, processor = super().load()
+            _attach_aurora(model, processor)
+            return model, processor
+
+    _AURORA_LOADER = AuroraQwen2_5OmniLoader
+else:
+
+    def get_model_tokenizer_aurora_qwen2_5_omni(model_dir, *args, **kwargs):
+        model, processor = get_model_tokenizer_qwen2_5_omni(model_dir, *args, **kwargs)
+        _attach_aurora(model, processor)
+        return model, processor
+
+    _AURORA_LOADER = get_model_tokenizer_aurora_qwen2_5_omni
+
+
+if _SWIFT_MAJOR >= 4:
+    _MODEL_META_KWARGS = dict(
+        loader=_AURORA_LOADER,
+        template=TEMPLATE_TYPE,
+    )
+else:
+    _MODEL_META_KWARGS = dict(
+        get_function=_AURORA_LOADER,
+        template=TEMPLATE_TYPE,
+    )
 
 
 register_model(
     ModelMeta(
         MODEL_TYPE,
         [ModelGroup([
-            Model("Qwen/Qwen2.5-Omni-3B", "Qwen/Qwen2.5-Omni-3B"),
-            Model("Qwen/Qwen2.5-Omni-7B", "Qwen/Qwen2.5-Omni-7B"),
+            Model("Qwen/Qwen2.5-Omni-3B",
+                  "Qwen/Qwen2.5-Omni-3B",
+                  model_path="/mnt/tbo/lvyf/AURORA/AURORA-main/models/Qwen2___5-Omni-3B"),
+            Model("Qwen/Qwen2.5-Omni-7B",
+                  "Qwen/Qwen2.5-Omni-7B",
+                  model_path="/mnt/tbo/lvyf/AURORA/AURORA-main/models/Qwen2___5-Omni-7B"),
         ])],
-        TEMPLATE_TYPE,
-        get_model_tokenizer_aurora_qwen2_5_omni,
         model_arch=ModelArch.qwen2_5_omni,
         is_multimodal=True,
         architectures=["Qwen2_5OmniModel", "Qwen2_5OmniForConditionalGeneration"],
         requires=["transformers>=4.50", "soundfile", "qwen_omni_utils", "decord"],
         tags=["vision", "video", "audio"],
         additional_saved_files=["spk_dict.pt"],
+        **_MODEL_META_KWARGS,
     )
 )
 
