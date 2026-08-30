@@ -1,0 +1,23 @@
+# 训练/评测产物(538G,不进 git)
+outputs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.ipynb_checkpoints/
+
+# 环境/系统
+.env
+*.log
+.DS_Store
+
+# 模型权重类大文件
+*.pth
+*.safetensors
+*.bin
+*.pt
+
+# 对话记录(本地文件,不属于代码)
+load.md

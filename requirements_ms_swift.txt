@@ -1,0 +1,56 @@
+# AURORA ms-swift SFT environment, tested with Python 3.10.
+#
+# Install this file first, then install/load the local ms-swift source tree as
+# described below.  The local tree used by AURORA has a stale package metadata
+# pin (transformers==4.46.0), while the Qwen2.5-Omni plugin is tested with
+# transformers==4.57.6.  Keeping ms-swift out of this resolver prevents pip
+# from silently downgrading the working Transformers stack.
+#
+# The CUDA wheel can be replaced as a group if the target machine requires a
+# different CUDA runtime. Keep torch/torchvision/torchaudio versions matched.
+# The cu118 wheels require a sufficiently new NVIDIA driver on V100/A100.
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+# PyTorch runtime used by the tested V100 setup; also works on A100 with a
+# sufficiently new NVIDIA driver.
+torch==2.7.1+cu118
+torchvision==0.22.1+cu118
+torchaudio==2.7.1+cu118
+
+# ms-swift/Transformers training stack.
+# ms-swift is intentionally not installed from PyPI; use the checked-out
+# source tree instead:
+#   pip install -e /mnt/hwnas-tbo/lvyf/cate-pred-embedding --no-deps
+# or export PYTHONPATH=/mnt/hwnas-tbo/lvyf/cate-pred-embedding:$PYTHONPATH
+modelscope==1.31.0
+transformers==4.57.6
+tokenizers==0.22.2
+accelerate==1.1.1
+deepspeed==0.18.1
+peft==0.17.1
+datasets==3.6.0
+safetensors==0.4.4
+pydantic==2.10.6
+psutil==6.0.0
+scipy==1.14.1
+
+# Qwen2.5-Omni media processing.
+qwen-omni-utils==0.0.9
+decord==0.6.0
+av==16.0.1
+soundfile==0.13.1
+librosa==0.11.0
+
+# AURORA/SAM preprocessing and data conversion.
+numpy==1.24.4
+opencv-python==4.10.0.84
+pandas==2.2.2
+Pillow==11.3.0
+PyYAML==6.0.2
+tqdm==4.66.5
+einops==0.8.0
+
+# Useful direct utilities and local smoke tests.
+huggingface-hub==0.36.2
+sentencepiece==0.1.99
+pytest==8.3.5
