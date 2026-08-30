@@ -143,19 +143,32 @@ def _extract_seg_hidden(
 def _mask_loss_from_seg_hidden(
     model: torch.nn.Module,
     seg_hidden: torch.Tensor,
-    rows: torch.Tensor,
+    seg_rows: torch.Tensor,
     batch: Dict[str, Any],
+    gate: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """Run text_hidden_fcs -> SAM on [SEG] hidden states; return (loss, parts).
 
-    ``rows`` maps each seg-hidden row back to its batch index so the right
+    ``seg_rows`` maps each seg-hidden row back to its batch index so the right
     frames/GT masks are used. Frames are shared per row (AURORA contract), so
-    only the rows that emitted [SEG] contribute — matching the
-  skip-if-no-[SEG] decision.
+    only the rows that emitted [SEG] contribute.
+
+    ``gate`` (shape ``[n_seg, 1]``, values 0/1) implements the DDP-symmetric
+    dummy path: when a batch has NO [SEG] at all we still run the SAME module
+    sequence (text_hidden_fcs -> prompt_encoder -> mask_decoder) on a zero
+    vector against the first row's frames, with gate=0 so the loss
+    contribution is exactly zero. This keeps the autograd graph — and
+    therefore the DDP gradient-hook firing order — IDENTICAL across ranks
+    regardless of their (independently sampled) rollouts. Without this,
+    per_device_train_batch_size=1 multi-GPU runs deadlock: ranks with [SEG]
+    fire hooks for sam modules that [SEG]-less ranks never touch, the NCCL
+    collective sequences diverge and both ranks block forever.
     """
     base = _unwrap(model)
     projector_dtype = next(base.text_hidden_fcs.parameters()).dtype
     text_prompts = base.text_hidden_fcs(seg_hidden.to(dtype=projector_dtype)).float()
+    if gate is not None:
+        text_prompts = text_prompts * gate.float()
 
     images = batch["sam_pixel_values"].to(
         device=seg_hidden.device, dtype=next(base.sam.image_encoder.parameters()).dtype
@@ -167,9 +180,16 @@ def _mask_loss_from_seg_hidden(
     image_embeddings = image_embeddings.view(batch_size, frame_count, *image_embeddings.shape[1:]).to(decoder_dtype)
     prompt_encoder_dtype = next(base.sam.prompt_encoder.parameters()).dtype
 
+    # DDP symmetry: iterate over a fixed row count. With no [SEG] in the batch
+    # we still process ONE dummy row (index 0) gated to zero.
+    if seg_rows is not None and len(seg_rows) > 0:
+        iter_rows = seg_rows.tolist()
+    else:
+        iter_rows = [0]
+
     bce = seg_hidden.new_zeros((), dtype=torch.float32)
     dice = seg_hidden.new_zeros((), dtype=torch.float32)
-    for i, batch_index in enumerate(rows.tolist()):
+    for i, batch_index in enumerate(iter_rows):
         prompt = text_prompts[i].to(prompt_encoder_dtype).view(1, 1, -1)
         sparse, dense = base.sam.prompt_encoder(points=None, boxes=None, masks=None, text_embeds=prompt)
         low_res_masks, _ = base.sam.mask_decoder(
@@ -192,11 +212,18 @@ def _mask_loss_from_seg_hidden(
         bce = bce + torch.nn.functional.binary_cross_entropy_with_logits(pred_mask, target)
         dice = dice + dice_loss(pred_mask, target)
 
-    n = len(rows)
+    n = len(iter_rows)
     bce = bce / n
     dice = dice / n
+    # Detach metrics BEFORE the gate multiplication so logged numbers stay
+    # interpretable (dummy path reports ~the ungated magnitude but its loss
+    # term below is exactly zero).
+    parts = {"mask_bce_loss": bce.detach(), "mask_dice_loss": dice.detach()}
     loss = base.aurora_bce_weight * bce + base.aurora_dice_weight * dice
-    return loss, {"mask_bce_loss": bce.detach(), "mask_dice_loss": dice.detach(), "mask_loss": loss.detach()}
+    if gate is not None:
+        loss = loss * gate.float().sum()
+    parts["mask_loss"] = loss.detach()
+    return loss, parts
 
 
 class AuroraGKDTrainer(GKDTrainer):
@@ -222,6 +249,11 @@ class AuroraGKDTrainer(GKDTrainer):
         ``compute_loss``) and the AURORA supervision tensors to be present in
         ``model_inputs`` (our template's collator puts them there for
         segmentation rows).
+
+        DDP-symmetric contract: the module call sequence is IDENTICAL whether
+        or not the batch emitted [SEG] — the no-[SEG] case runs one dummy row
+        (zero hidden state, gate=0) through the same text_hidden_fcs ->
+        prompt_encoder -> mask_decoder path. See _mask_loss_from_seg_hidden.
         """
         labels = model_inputs["labels"]
         if "sam_pixel_values" not in model_inputs:
@@ -231,22 +263,26 @@ class AuroraGKDTrainer(GKDTrainer):
                 "and the aurora template is in use."
             )
         hidden = outputs.hidden_states[-1]
-        seg_hidden, total = _extract_seg_hidden(model, hidden, labels)
-        if seg_hidden is None:
-            zero = hidden.new_zeros((), dtype=torch.float32)
-            return zero * 0, {
-                "mask_bce_loss": zero.detach(),
-                "mask_dice_loss": zero.detach(),
-                "mask_loss": zero.detach(),
-                "seg_rows": torch.tensor(0.0),
-            }
         base = _unwrap(model)
         seg_mask = labels.eq(base.aurora_tokenizer.convert_tokens_to_ids(SEG_TOKEN))
-        first_idx = seg_mask.int().argmax(dim=-1)
         has_seg = seg_mask.any(dim=-1)
         rows = torch.nonzero(has_seg, as_tuple=False).squeeze(-1)
-        loss, parts = _mask_loss_from_seg_hidden(model, seg_hidden, rows, model_inputs)
-        parts["seg_rows"] = torch.tensor(float(len(rows)))
+        n_seg = len(rows)
+
+        if n_seg > 0:
+            first_idx = seg_mask.int().argmax(dim=-1)
+            positions = first_idx[rows]
+            seg_hidden = hidden[rows, positions]  # [n_seg, D]
+            gate = None
+        else:
+            # Dummy row: zero vector from the FIRST sequence position, gated
+            # to zero. Same modules fire, loss contribution is exactly 0.
+            seg_hidden = hidden[0, 0:1, :] * 1.0  # [1, D], keeps autograd
+            gate = seg_hidden.new_zeros((1, 1))
+            rows = torch.zeros(1, dtype=torch.long, device=hidden.device)
+
+        loss, parts = _mask_loss_from_seg_hidden(model, seg_hidden, rows, model_inputs, gate=gate)
+        parts["seg_rows"] = torch.tensor(float(n_seg))
         return loss, parts
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
